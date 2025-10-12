@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+import argparse
+import logging
+import os
+import sys
+import time
+
+import requests
+
+
+class CloudflareClient:
+    API_URL = "https://api.cloudflare.com/client/v4"
+    TIMEOUT = 10
+
+    def __init__(self, token):
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+    def get_zones(self, subdomains=None):
+        url_zones = f"{self.API_URL}/zones"
+        params = {
+            "page": 1,
+            "per_page": 50,  # Max allowed for this param
+        }
+        if subdomains and "*" not in subdomains:
+            domains = self._get_parent_domains(subdomains)
+            params["name"] = ",".join(domains)
+
+        zones = []
+        for _page in range(10):  # max 500 zones allowed via API (10*50)
+            response = requests.get(
+                url_zones, params=params, headers=self.headers, timeout=self.TIMEOUT
+            )
+            data = response.json()
+            if not data.get("success"):
+                errors = data.get("errors") or data
+                raise Exception(
+                    f"Error while calling endpoint to fetch zones: {errors}"
+                )
+            zones.extend(data["result"])
+
+            # Check if we're in the last page
+            result_info = data["result_info"]
+            if result_info["page"] >= result_info["total_pages"]:
+                break
+            params["page"] += 1
+
+        return zones
+
+    def get_dns_records(self, zone_id, subdomains=None):
+        url_records = f"{self.API_URL}/zones/{zone_id}/dns_records"
+        params = {
+            "per_page": 5000000,  # Max allowed for this param
+            "match": "any",
+        }
+        if subdomains and "*" not in subdomains:
+            params["name"] = list(subdomains)
+
+        # Not paginating because the number of records per page is big enough
+        response = requests.get(
+            url_records, params=params, headers=self.headers, timeout=self.TIMEOUT
+        )
+        data = response.json()
+        if not data.get("success"):
+            errors = data.get("errors") or data
+            raise Exception(
+                f"Error while calling endpoint to fetch DNS records: {errors}"
+            )
+
+        # Filter locally A records.
+        # This is needed because:
+        # - With `match=all` (default), the API tries to match all subdomains at once
+        #   (name=sub1 AND name=sub2), which never succeeds.
+        # - With `match=any` and `type=A`, the API returns every A record, since the
+        #   condition becomes (type=A OR name=sub), ignoring the names.
+        # Therefore we query with `match=any` and no `type`, then filter the result
+        a_records = [r for r in data["result"] if r["type"] == "A"]
+        return a_records
+
+    def update_dns_record(self, zone_id, record_id, new_ip):
+        url_update = f"{self.API_URL}/zones/{zone_id}/dns_records/{record_id}"
+        params = {"content": new_ip}
+        response = requests.patch(
+            url_update, json=params, headers=self.headers, timeout=self.TIMEOUT
+        )
+        data = response.json()
+        if not data.get("success"):
+            errors = data.get("errors") or data
+            raise Exception(
+                f"Error while calling endpoint to update DNS records: {errors}"
+            )
+
+    def _get_parent_domains(self, subdomains):
+        """Determine all possible parent domains that could contain the provided subdomains
+
+        For instance, the subdomain *.subdomain.test.example.com would return:
+        - subdomain.test.example.com
+        - test.example.com
+        - example.com
+        """
+        domains = []
+        for subdomain in subdomains:
+            for level in range(0, subdomain.count(".")):
+                domains.append(subdomain.split(".", level)[-1].lstrip("*."))
+        return list(set(domains))
+
+
+class PublicIpStorage:
+    def __init__(self, file):
+        self.file = file
+
+    def get_current_ip(self):
+        """Get current public IP using the service provided by Cloudflare"""
+        response = requests.get("https://1.1.1.1/cdn-cgi/trace", timeout=10)
+        response.raise_for_status()
+        ip_line = next(
+            (l for l in response.text.splitlines() if l.startswith("ip=")), None
+        )
+        if not ip_line:
+            raise RuntimeError("No IP found in Cloudflare trace output")
+        ip = ip_line.split("=", 1)[1].strip()
+        return ip
+
+    def get_saved_ip(self):
+        """Get the previously saved public IP"""
+        self.file.seek(0)
+        return self.file.read().strip()
+
+    def save_ip(self, ip):
+        self.file.truncate(0)
+        self.file.write(ip + "\n")
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Update Cloudflare DNS A records when Public IP changes.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "-t",
+        "--api-token",
+        default=argparse.SUPPRESS,
+        help="Cloudflare API token. "
+        "Warning: prefer the environment variable $CLOUDFLARE_API_TOKEN instead, "
+        "as parameters could be seen when listing processes.",
+    )
+    parser.add_argument(
+        "-e",
+        "--every",
+        dest="minutes",
+        default=0,
+        type=int,
+        help="Try to update the DNS records every N minutes , 0 means run only once.",
+    )
+    parser.add_argument(
+        "--subdomains",
+        default="*",
+        help="Subdomains to update, comma separated, e.g., 'example.com,*.example.com'; "
+        "use '*' to update all subdomains linked to the token.",
+    )
+    parser.add_argument(
+        "--ip-file",
+        default="/tmp/current-public-ip.txt",
+        type=argparse.FileType("a+"),
+        help="Path to file storing the last known public IP.",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Update DNS records even if public IP has not changed.",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("error", "warning", "info", "debug"),
+        default="info",
+        help="Specify the level of the logging.",
+    )
+    parser.add_argument(
+        "--log-format",
+        default="%(asctime)s - %(levelname)s - %(message)s",
+        help="Specify the format used to log messages.",
+    )
+    args = parser.parse_args()
+
+    # Parse subdomains to process a comma-separated list
+    args.subdomains = [d.strip() for d in args.subdomains.split(",") if d.strip()]
+
+    # Allow the token to be passed as env var
+    if "api_token" not in args:
+        args.api_token = os.getenv("CLOUDFLARE_API_TOKEN")
+
+    return args
+
+
+def check_and_update(args):
+    ip_storage = PublicIpStorage(file=args.ip_file)
+    previous_ip = ip_storage.get_saved_ip()
+    new_ip = ip_storage.get_current_ip()
+    if new_ip == previous_ip:
+        if args.force:
+            logging.info(
+                "IP %s has not changed but you asked to update records anyway", new_ip
+            )
+        else:
+            logging.info("IP %s has not changed, skipping updates", new_ip)
+            return False
+    else:
+        logging.info("IP changed to %s, updating Cloudflare records...", new_ip)
+
+    client = CloudflareClient(token=args.api_token)
+    try:
+        zones = client.get_zones(subdomains=args.subdomains)
+    except Exception as e:
+        logging.error("Error fetching zones: %s", e)
+        return False
+
+    # Get all zones before updating anything, in case it fails at some point
+    dns_records_to_update = []
+    for zone in zones:
+        try:
+            records = client.get_dns_records(
+                zone_id=zone["id"], subdomains=args.subdomains
+            )
+        except Exception as e:
+            logging.error("Error fetching records for the zone %s: %s", zone["name"], e)
+            return False
+        if records:
+            dns_records_to_update.append((zone, records))
+
+    # Update records
+    processed_subdomains = []
+    for zone, records in dns_records_to_update:
+        logging.info(
+            "Processing zone %s that contains %d matching records",
+            zone["name"],
+            len(records),
+        )
+        for record in records:
+            record_name = record["name"]
+            processed_subdomains.append(record_name)
+            old_content = record["content"]
+            if old_content == new_ip:
+                logging.info(
+                    "Record %s is already pointing to %s, not updating",
+                    record_name,
+                    new_ip,
+                )
+                continue
+            logging.info("Updating record %s", record_name)
+            try:
+                client.update_dns_record(
+                    record_id=record["id"],
+                    zone_id=zone["id"],
+                    new_ip=new_ip,
+                )
+            except Exception as e:
+                logging.error("Error updating record %s: %s", record_name, e)
+                return False
+            logging.info(
+                "Updated record %s, from %s to %s", record_name, old_content, new_ip
+            )
+
+    # Check if there were subdomains not updated
+    missing_subdomains = set(args.subdomains) - set(processed_subdomains) - {"*"}
+    if missing_subdomains:
+        logging.warning(
+            "The following subdomains were not found, they have not been updated: %s",
+            ", ".join(missing_subdomains),
+        )
+
+    ip_storage.save_ip(new_ip)
+    return True
+
+
+def main():
+    args = parse_arguments()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format=args.log_format,
+    )
+
+    if not args.api_token:
+        logging.error(
+            "Missing API token, please provide it using the environment variable "
+            "$CLOUDFLARE_API_TOKEN"
+        )
+        sys.exit(1)
+
+
+def main():
+    args = parse_arguments()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format=args.log_format,
+    )
+
+    if not args.api_token:
+        logging.error(
+            "Missing API token, please provide it using the environment variable "
+            "$CLOUDFLARE_API_TOKEN"
+        )
+        sys.exit(1)
+
+    try:
+        while True:
+            check_and_update(args)
+            if not args.minutes:
+                break
+            time.sleep(60 * args.minutes)
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user, exiting gracefully")
+
+
+if __name__ == "__main__":
+    main()
