@@ -113,7 +113,11 @@ class PublicIpStorage:
 
     def get_current_ip(self):
         """Get current public IP using the service provided by Cloudflare"""
-        response = requests.get("https://1.1.1.1/cdn-cgi/trace", timeout=10)
+        response = requests.get(
+            "https://1.1.1.1/cdn-cgi/trace",
+            headers={"Host": "one.one.one.one"},
+            timeout=10,
+        )
         response.raise_for_status()
         ip_line = next(
             (l for l in response.text.splitlines() if l.startswith("ip=")), None
