@@ -50,6 +50,26 @@ you can also provide specific subdomains to update:
 
 Use `--help` to see a full list of available parameters.
 
+## Keep running after reboots
+
+The simplest way is to set up a scheduled task using `crontab` for your user:
+
+```bash
+mkdir -p ~/.local/bin
+cp cloudflare-update-dns ~/.local/bin
+crontab -e
+```
+
+Then add:
+
+```bash
+CLOUDFLARE_API_TOKEN="your_token_here"
+*/5 * * * * ~/.local/bin/cloudflare-update-dns >> /tmp/cloudflare-update-dns.log 2>&1
+```
+
+In this example, the job runs every 5 minutes and logs the result to
+`/tmp/cloudflare-update-dns.log`. Adjust as needed.
+
 ---
 
 ## Creating a Cloudflare API Token
