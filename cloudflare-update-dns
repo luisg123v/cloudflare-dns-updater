@@ -202,7 +202,13 @@ def parse_arguments():
 def check_and_update(args):
     ip_storage = PublicIpStorage(file=args.ip_file)
     previous_ip = ip_storage.get_saved_ip()
-    new_ip = ip_storage.get_current_ip()
+
+    try:
+        new_ip = ip_storage.get_current_ip()
+    except Exception as e:
+        logging.error("Error fetching current public IP: %s", e)
+        return False
+
     if new_ip == previous_ip:
         if args.force:
             logging.info(
