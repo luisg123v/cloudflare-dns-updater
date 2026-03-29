@@ -293,21 +293,6 @@ def main():
         )
         sys.exit(1)
 
-
-def main():
-    args = parse_arguments()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
-        format=args.log_format,
-    )
-
-    if not args.api_token:
-        logging.error(
-            "Missing API token, please provide it using the environment variable "
-            "$CLOUDFLARE_API_TOKEN"
-        )
-        sys.exit(1)
-
     try:
         while True:
             check_and_update(args)
